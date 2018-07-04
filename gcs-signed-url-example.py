@@ -16,177 +16,225 @@
 
 import base64
 import datetime
-import md5
+import hashlib
+import os
 import sys
 import time
-
-import Crypto.Hash.SHA256 as SHA256
-import Crypto.PublicKey.RSA as RSA
-import Crypto.Signature.PKCS1_v1_5 as PKCS1_v1_5
 import requests
 
+from oauth2client.service_account import ServiceAccountCredentials
+from google.cloud import storage
+
 try:
-  import conf
+    import conf
 except ImportError:
-  sys.exit('Configuration module not found. You must create a conf.py file. '
-           'See the example in conf.example.py.')
+    sys.exit('Configuration module not found. You must create a conf.py file. '
+             'See the example in conf.example.py.')
 
 # The Google Cloud Storage API endpoint. You should not need to change this.
 GCS_API_ENDPOINT = 'https://storage.googleapis.com'
 
 
 class CloudStorageURLSigner(object):
-  """Contains methods for generating signed URLs for Google Cloud Storage."""
+    """Contains methods for generating signed URLs for Google Cloud Storage."""
 
-  def __init__(self, key, client_id_email, gcs_api_endpoint, expiration=None,
-               session=None):
-    """Creates a CloudStorageURLSigner that can be used to access signed URLs.
+    def __init__(self, creds, client_storage, client_id_email, gcs_api_endpoint, expiration=None,
+                 session=None):
+        """Creates a CloudStorageURLSigner that can be used to access signed URLs.
+
+        Args:
+          creds: A Google Account Service private key.
+          service_account_email: GCS service account email.
+          gcs_api_endpoint: Base URL for GCS API.
+          expiration: An instance of datetime.datetime containing the time when the
+                      signed URL should expire.
+          session: A requests.session.Session to use for issuing requests. If not
+                   supplied, a new session is created.
+        """
+        self.creds = creds
+        self.client_storage = client_storage
+        self.service_account_email = creds.service_account_email
+        self.gcs_api_endpoint = gcs_api_endpoint
+
+        self.expiration = expiration or (datetime.datetime.now() +
+                                         datetime.timedelta(days=1))
+        self.expiration = int(time.mktime(self.expiration.timetuple()))
+
+        self.session = session or requests.Session()
+
+    def __base64_sign(self, plaintext):
+        """Signs and returns a base64-encoded SHA256 digest."""
+        # shahash = hashlib.sha256(plaintext.encode('utf-8')).hexdigest()
+
+        # signer = PKCS1_v1_5.new(self.key)
+        # signature_bytes = signer.sign(shahash)
+        # return base64.b64encode(signature_bytes)
+
+        # creds = ServiceAccountCredentials.from_p12_keyfile(os.path.realpath('.'),  'private_key2.der')
+        _, signature_bytes = self.creds.sign_blob(plaintext)
+        signature = base64.b64encode(signature_bytes)
+        return signature
+
+    def __make_signature_string(self, verb, path, content_md5, content_type):
+        """Creates the signature string for signing according to GCS docs."""
+        signature_string = ('{verb}\n'
+                            '{content_md5}\n'
+                            '{content_type}\n'
+                            '{expiration}\n'
+                            '{resource}')
+        return signature_string.format(verb=verb,
+                                       content_md5=content_md5,
+                                       content_type=content_type,
+                                       expiration=self.expiration,
+                                       resource=path)
+
+    def __make_url(self, verb, path, content_type='', content_md5=''):
+        """Forms and returns the full signed URL to access GCS."""
+        base_url = '%s%s' % (self.gcs_api_endpoint, path)
+        signature_string = self.__make_signature_string(verb, path, content_md5,
+                                                        content_type)
+        signature_signed = self.__base64_sign(signature_string)
+        query_params = {'GoogleAccessId': self.service_account_email,
+                        'Expires': str(self.expiration),
+                        'Signature': signature_signed}
+        return base_url, query_params
+
+    def get(self, path):
+        """Performs a GET request.
+
+        Args:
+          path: The relative API path to access, e.g. '/bucket/object'.
+
+        Returns:
+          An instance of requests.Response containing the HTTP response.
+        """
+        base_url, query_params = self.__make_url('GET', path)
+        return self.session.get(base_url, params=query_params)
+
+    def get_by_signed_url(self):
+        bucket = self.client_storage.bucket(conf.BUCKET_NAME)
+        blob = bucket.blob(conf.OBJECT_NAME)
+        url_lifetime = self.expiration  # Seconds in an hour
+        serving_url = blob.generate_signed_url(url_lifetime)
+        return self.session.get(serving_url)
+
+    def put(self, path, content_type, data):
+        """Performs a PUT request.
+
+        Args:
+          path: The relative API path to access, e.g. '/bucket/object'.
+          content_type: The content type to assign to the upload.
+          data: The file data to upload to the new file.
+
+        Returns:
+          An instance of requests.Response containing the HTTP response.
+        """
+        md5_digest = base64.b64encode(hashlib.md5(data.encode('utf-8')).digest()).decode('utf-8')
+        base_url, query_params = self.__make_url('PUT', path, content_type,
+                                                 md5_digest)
+        headers = {}
+        headers['Content-Type'] = content_type
+        headers['Content-Length'] = str(len(data))
+        headers['Content-MD5'] = md5_digest
+        resp = self.session.put(base_url, params=query_params, headers=headers,
+                                data=data)
+        return resp
+
+    def generate_pre_signed_url(self, path, content_type):
+        """Performs a presigned URL to PUT request.
+
+        Args:
+          path: The relative API path to access, e.g. '/bucket/object'.
+          content_type: The content type to assign to the upload.
+          data: The file data to upload to the new file.
+
+        Returns:
+          An instance of requests.Response containing the HTTP response.
+        """
+        base_url, query_params = self.__make_url('PUT', path, content_type)
+        headers = {}
+        headers['Content-Type'] = content_type
+        resp = self.session.put(base_url, params=query_params, headers=headers)
+
+        return resp.url
+
+    def delete(self, path):
+        """Performs a DELETE request.
+
+        Args:
+          path: The relative API path to access, e.g. '/bucket/object'.
+
+        Returns:
+          An instance of requests.Response containing the HTTP response.
+        """
+        base_url, query_params = self.__make_url('DELETE', path)
+        return self.session.delete(base_url, params=query_params)
+
+
+def process_response(r, expected_status=200):
+    """Prints request and response information and checks for desired return code.
 
     Args:
-      key: A PyCrypto private key.
-      client_id_email: GCS service account email.
-      gcs_api_endpoint: Base URL for GCS API.
-      expiration: An instance of datetime.datetime containing the time when the
-                  signed URL should expire.
-      session: A requests.session.Session to use for issuing requests. If not
-               supplied, a new session is created.
+      r: A requests.Response object.
+      expected_status: The expected HTTP status code.
+
+    Raises:
+      SystemExit if the response code doesn't match expected_status.
     """
-    self.key = key
-    self.client_id_email = client_id_email
-    self.gcs_api_endpoint = gcs_api_endpoint
-
-    self.expiration = expiration or (datetime.datetime.now() +
-                                     datetime.timedelta(days=1))
-    self.expiration = int(time.mktime(self.expiration.timetuple()))
-
-    self.session = session or requests.Session()
-
-  def _Base64Sign(self, plaintext):
-    """Signs and returns a base64-encoded SHA256 digest."""
-    shahash = SHA256.new(plaintext)
-    signer = PKCS1_v1_5.new(self.key)
-    signature_bytes = signer.sign(shahash)
-    return base64.b64encode(signature_bytes)
-
-  def _MakeSignatureString(self, verb, path, content_md5, content_type):
-    """Creates the signature string for signing according to GCS docs."""
-    signature_string = ('{verb}\n'
-                        '{content_md5}\n'
-                        '{content_type}\n'
-                        '{expiration}\n'
-                        '{resource}')
-    return signature_string.format(verb=verb,
-                                   content_md5=content_md5,
-                                   content_type=content_type,
-                                   expiration=self.expiration,
-                                   resource=path)
-
-  def _MakeUrl(self, verb, path, content_type='', content_md5=''):
-    """Forms and returns the full signed URL to access GCS."""
-    base_url = '%s%s' % (self.gcs_api_endpoint, path)
-    signature_string = self._MakeSignatureString(verb, path, content_md5,
-                                                 content_type)
-    signature_signed = self._Base64Sign(signature_string)
-    query_params = {'GoogleAccessId': self.client_id_email,
-                    'Expires': str(self.expiration),
-                    'Signature': signature_signed}
-    return base_url, query_params
-
-  def Get(self, path):
-    """Performs a GET request.
-
-    Args:
-      path: The relative API path to access, e.g. '/bucket/object'.
-
-    Returns:
-      An instance of requests.Response containing the HTTP response.
-    """
-    base_url, query_params = self._MakeUrl('GET', path)
-    return self.session.get(base_url, params=query_params)
-
-  def Put(self, path, content_type, data):
-    """Performs a PUT request.
-
-    Args:
-      path: The relative API path to access, e.g. '/bucket/object'.
-      content_type: The content type to assign to the upload.
-      data: The file data to upload to the new file.
-
-    Returns:
-      An instance of requests.Response containing the HTTP response.
-    """
-    md5_digest = base64.b64encode(md5.new(data).digest())
-    base_url, query_params = self._MakeUrl('PUT', path, content_type,
-                                           md5_digest)
-    headers = {}
-    headers['Content-Type'] = content_type
-    headers['Content-Length'] = str(len(data))
-    headers['Content-MD5'] = md5_digest
-    return self.session.put(base_url, params=query_params, headers=headers,
-                            data=data)
-
-  def Delete(self, path):
-    """Performs a DELETE request.
-
-    Args:
-      path: The relative API path to access, e.g. '/bucket/object'.
-
-    Returns:
-      An instance of requests.Response containing the HTTP response.
-    """
-    base_url, query_params = self._MakeUrl('DELETE', path)
-    return self.session.delete(base_url, params=query_params)
-
-
-def ProcessResponse(r, expected_status=200):
-  """Prints request and response information and checks for desired return code.
-
-  Args:
-    r: A requests.Response object.
-    expected_status: The expected HTTP status code.
-
-  Raises:
-    SystemExit if the response code doesn't match expected_status.
-  """
-  print '--- Request ---'
-  print r.request.url
-  for header, value in r.request.headers.iteritems():
-    print '%s: %s' % (header, value)
-  print '---------------'
-  print '--- Response (Status %s) ---' % r.status_code
-  print r.content
-  print '-----------------------------'
-  print
-  if r.status_code != expected_status:
-    sys.exit('Exiting due to receiving %d status code when expecting %d.'
-             % (r.status_code, expected_status))
+    print('--- Request ---')
+    print(r.request.url)
+    for header, value in r.request.headers.items():
+        print('%s: %s' % (header, value))
+    print('---------------')
+    print('--- Response (Status %s) ---' % r.status_code)
+    print(r.content)
+    print('-----------------------------')
+    print
+    if r.status_code != expected_status:
+        sys.exit('Exiting due to receiving %d status code when expecting %d.'
+                 % (r.status_code, expected_status))
 
 
 def main():
-  try:
-    keytext = open(conf.PRIVATE_KEY_PATH, 'rb').read()
-  except IOError as e:
-    sys.exit('Error while reading private key: %s' % e)
+    try:
+        keytext = open(conf.PRIVATE_KEY_PATH, 'rb').read()
+    except IOError as e:
+        sys.exit('Error while reading private key: %s' % e)
 
-  private_key = RSA.importKey(keytext)
-  signer = CloudStorageURLSigner(private_key, conf.SERVICE_ACCOUNT_EMAIL,
-                                 GCS_API_ENDPOINT)
+    creds = ServiceAccountCredentials.from_json_keyfile_name(conf.PRIVATE_KEY_PATH)
+    client_storage = storage.Client.from_service_account_json(conf.PRIVATE_KEY_PATH)
 
-  file_path = '/%s/%s' % (conf.BUCKET_NAME, conf.OBJECT_NAME)
+    signer = CloudStorageURLSigner(creds, client_storage, conf.SERVICE_ACCOUNT_EMAIL,
+                                   GCS_API_ENDPOINT)
 
-  print 'Creating file...'
-  print '================'
-  r = signer.Put(file_path, 'text/plain', 'blah blah')
-  ProcessResponse(r)
-  print 'Retrieving file...'
-  print '=================='
-  r = signer.Get(file_path)
-  ProcessResponse(r)
-  print 'Deleting file...'
-  print '================'
-  r = signer.Delete(file_path)
-  ProcessResponse(r, expected_status=204)
-  print 'Done.'
+    file_path = '/%s/%s' % (conf.BUCKET_NAME, conf.OBJECT_NAME)
+
+    print('Creating presigned URL...')
+    print('================')
+    r = signer.generate_pre_signed_url(file_path, 'text/plain')
+    print(r)
+
+    print('Creating file...')
+    print('================')
+    r = signer.put(file_path, 'text/plain', 'blah blah')
+    print(r)
+
+    print('Retrieving file with signed URL...')
+    print('==================')
+    r = signer.get_by_signed_url()
+    process_response(r)
+
+    print('Retrieving file...')
+    print('==================')
+    r = signer.get(file_path)
+    process_response(r)
+
+    print('Deleting file...')
+    print('================')
+    r = signer.delete(file_path)
+    process_response(r, expected_status=204)
+    print('Done.')
+
 
 if __name__ == '__main__':
-  main()
+    main()
