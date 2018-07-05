@@ -154,8 +154,7 @@ class CloudStorageURLSigner(object):
         base_url, query_params = self.__make_url('PUT', path, content_type)
         headers = {}
         headers['Content-Type'] = content_type
-        resp = self.session.put(base_url, params=query_params, headers=headers)
-
+        resp = requests.Request('PUT', base_url, params=query_params, headers=headers).prepare()
         return resp.url
 
     def delete(self, path):
